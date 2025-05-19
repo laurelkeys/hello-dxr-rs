@@ -13,6 +13,7 @@ use consts::NO_AA;
 use std::{
     cmp::max,
     num::NonZeroU64,
+    ops::DerefMut,
     sync::{Arc, Mutex},
 };
 
@@ -37,7 +38,7 @@ struct Resources {
     fence: ID3D12Fence,
     fence_value: NonZeroU64,
     swap_chain: IDXGISwapChain3,
-    render_target: ID3D12Resource,
+    render_target: Option<ID3D12Resource>,
     uav_heap: ID3D12DescriptorHeap,
 }
 
@@ -49,22 +50,23 @@ struct Context {
 
 impl Context {
     fn new() -> windows::core::Result<Self> {
-        // Init Device.
-        unsafe {
-            let mut debug: Option<ID3D12Debug> = None;
-            if let Some(debug) = D3D12GetDebugInterface(&mut debug).ok().and(debug) {
-                debug.EnableDebugLayer();
+        let mut factory_flags = DXGI_CREATE_FACTORY_FLAGS::default();
+
+        if cfg!(debug_assertions) {
+            unsafe {
+                let mut debug: Option<ID3D12Debug> = None;
+                if let Some(debug) = D3D12GetDebugInterface(&mut debug).ok().and(debug) {
+                    factory_flags |= DXGI_CREATE_FACTORY_DEBUG;
+                    debug.EnableDebugLayer();
+                }
             }
         }
 
-        let factory: IDXGIFactory4 = unsafe {
-            CreateDXGIFactory2(DXGI_CREATE_FACTORY_DEBUG)
-                /* .or_else(|_| CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))) */?
-        };
+        let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(factory_flags) }?;
 
         let device = {
             let mut device: Option<ID3D12Device5> = None;
-            unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_2, &mut device)? };
+            unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_2, &mut device) }?;
             device.expect("device should not be null after D3D12CreateDevice is ok")
         };
 
@@ -83,10 +85,8 @@ fn main() -> windows::core::Result<()> {
 
     let context = Arc::new(Mutex::new(Context::new()?));
 
-    unsafe {
-        // @Todo: add a CLI option to DPI_AWARENESS_CONTEXT_UNAWARE (e.g. --dpi-unaware).
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)?;
-    }
+    // @Todo: add a CLI option to DPI_AWARENESS_CONTEXT_UNAWARE (e.g. --dpi-unaware).
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }?;
 
     let class_name = windows::core::w!("HelloDxrClass");
 
@@ -113,19 +113,19 @@ fn main() -> windows::core::Result<()> {
             None,
             None,
             None,
-        )?
-    };
+        )
+    }?;
 
     // @Test: instead of moving the cloned value with Arc::into_raw, just cast the context to
-    // a `*mut Mutex<Context>` and avoid `drop(unsafe { Arc::from_raw(context_ptr) })` in `resize`.
+    // a `*mut Mutex<Context>` and avoid `drop(unsafe { Arc::from_raw(context_ptr) })` in `wnd_proc`.
     let context_for_window = Arc::clone(&context);
     unsafe {
         SetWindowLongPtrW(
             hwnd,
             GWLP_USERDATA,
             Arc::into_raw(context_for_window) as isize,
-        );
-    }
+        )
+    };
 
     init_resources(hwnd, context)?;
 
@@ -137,8 +137,8 @@ fn main() -> windows::core::Result<()> {
             }
 
             unsafe {
-                let translated = TranslateMessage(&msg).as_bool();
-                assert!(translated, "TranslateMessage: {:?}", GetLastError());
+                let _translated = TranslateMessage(&msg).as_bool();
+                // @Fixme: assert!(translated, "TranslateMessage: {:?}", GetLastError());
                 DispatchMessageW(&msg);
             }
         }
@@ -161,8 +161,8 @@ fn init_resources(hwnd: HWND, context: Arc<Mutex<Context>>) -> windows::core::Re
                 .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                     Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                     ..Default::default()
-                })?
-        };
+                })
+        }?;
 
         let swap_chain: IDXGISwapChain3 = {
             let swap_chain1: IDXGISwapChain1 = unsafe {
@@ -179,22 +179,19 @@ fn init_resources(hwnd: HWND, context: Arc<Mutex<Context>>) -> windows::core::Re
                     },
                     None,
                     None,
-                )?
-            };
+                )
+            }?;
             swap_chain1.cast()?
         };
 
         // drop(context.factory); // @Test: the factory is no longer needed, so we may as well drop it
 
-        // @Fixme: context.render_target is actually initialized by `resize`.
-        let render_target: ID3D12Resource = unsafe { swap_chain.GetBuffer(0 as u32)? };
-
         context.resources = Some(Resources {
             cmd_queue,
-            fence: unsafe { context.device.CreateFence(0, D3D12_FENCE_FLAG_NONE)? },
+            fence: unsafe { context.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?,
             fence_value: NonZeroU64::new(1).unwrap(),
             swap_chain,
-            render_target,
+            render_target: None, // initialized on `resize`
             uav_heap: unsafe {
                 context
                     .device
@@ -203,8 +200,8 @@ fn init_resources(hwnd: HWND, context: Arc<Mutex<Context>>) -> windows::core::Re
                         NumDescriptors: 1,
                         Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                         ..Default::default()
-                    })?
-            },
+                    })
+            }?,
         });
     }
 
@@ -248,44 +245,18 @@ extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Conte
     let width = max(1, rect.right - rect.left);
     let height = max(1, rect.bottom - rect.top);
 
-    let mut new_render_target: Option<ID3D12Resource> = None;
-    if context.resources.is_some() {
-        unsafe {
-            context
-                .device
-                .CreateCommittedResource(
-                    &D3D12_HEAP_PROPERTIES {
-                        Type: D3D12_HEAP_TYPE_DEFAULT,
-                        ..Default::default()
-                    },
-                    D3D12_HEAP_FLAG_NONE,
-                    &D3D12_RESOURCE_DESC {
-                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-                        Width: width as u64,
-                        Height: height as u32,
-                        DepthOrArraySize: 1,
-                        MipLevels: 1,
-                        Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                        SampleDesc: NO_AA,
-                        Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
-                        ..Default::default()
-                    },
-                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
-                    None,
-                    &mut new_render_target,
-                )
-                .unwrap();
-        }
-    }
-
-    if let Some(resources) = context.resources.as_mut() {
-        let new_fence_value = signal_and_wait(
+    if let Context {
+        device,
+        resources: Some(resources),
+        ..
+    } = &mut *context
+    {
+        resources.fence_value = signal_and_wait(
             resources.fence_value,
             &resources.cmd_queue,
             &resources.fence,
         )
         .unwrap();
-        resources.fence_value = new_fence_value;
 
         unsafe {
             resources.swap_chain.ResizeBuffers(
@@ -298,14 +269,37 @@ extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Conte
         }
         .unwrap();
 
-        resources.render_target = new_render_target
-            .expect("new_render_target should not be null after CreateCommittedResource is ok");
-    }
-
-    if let Some(resources) = context.resources.as_ref() {
         unsafe {
-            context.device.CreateUnorderedAccessView(
-                &resources.render_target,
+            device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_DEFAULT,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &D3D12_RESOURCE_DESC {
+                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+                    Width: width as u64,
+                    Height: height as u32,
+                    DepthOrArraySize: 1,
+                    MipLevels: 1,
+                    Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+                    SampleDesc: NO_AA,
+                    Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                    ..Default::default()
+                },
+                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                None,
+                &mut resources.render_target,
+            )
+        }
+        .unwrap();
+
+        unsafe {
+            device.CreateUnorderedAccessView(
+                resources
+                    .render_target
+                    .as_ref()
+                    .expect("render_target should not be null after CreateCommittedResource is ok"),
                 None,
                 Some(&D3D12_UNORDERED_ACCESS_VIEW_DESC {
                     Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -313,8 +307,8 @@ extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Conte
                     ..Default::default()
                 }),
                 resources.uav_heap.GetCPUDescriptorHandleForHeapStart(),
-            );
-        }
+            )
+        };
     }
 }
 
