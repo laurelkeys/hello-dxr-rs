@@ -1,28 +1,8 @@
-/* use windows::Win32::Graphics::Direct3D12::*; */
-use windows::Win32::Graphics::Dxgi::Common::*;
+use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 
 pub const NO_AA: DXGI_SAMPLE_DESC = DXGI_SAMPLE_DESC {
     Count: 1,
     Quality: 0,
-};
-
-/*
-pub const DEFAULT_HEAP: D3D12_HEAP_PROPERTIES = D3D12_HEAP_PROPERTIES {
-    Type: D3D12_HEAP_TYPE_DEFAULT,
-    // ..Default::default()
-    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-    MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
-    CreationNodeMask: 0,
-    VisibleNodeMask: 0,
-};
-
-pub const UPLOAD_HEAP: D3D12_HEAP_PROPERTIES = D3D12_HEAP_PROPERTIES {
-    Type: D3D12_HEAP_TYPE_UPLOAD,
-    // ..Default::default()
-    CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
-    MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
-    CreationNodeMask: 0,
-    VisibleNodeMask: 0,
 };
 
 pub const BASIC_BUFFER_DESC: D3D12_RESOURCE_DESC = D3D12_RESOURCE_DESC {
@@ -37,4 +17,38 @@ pub const BASIC_BUFFER_DESC: D3D12_RESOURCE_DESC = D3D12_RESOURCE_DESC {
     Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
     Flags: D3D12_RESOURCE_FLAG_NONE,
 };
-*/
+
+#[rustfmt::skip]
+pub const QUAD_VERTICES: [f32; 18] = [
+    -1.0, 0.0, -1.0,
+    -1.0, 0.0,  1.0,
+     1.0, 0.0,  1.0,
+    -1.0, 0.0, -1.0,
+     1.0, 0.0, -1.0,
+     1.0, 0.0,  1.0,
+];
+
+#[rustfmt::skip]
+pub const CUBE_VERTICES: [f32; 24] = [
+    -1.0, -1.0, -1.0,
+     1.0, -1.0, -1.0,
+    -1.0,  1.0, -1.0,
+     1.0,  1.0, -1.0,
+    -1.0, -1.0,  1.0,
+     1.0, -1.0,  1.0,
+    -1.0,  1.0,  1.0,
+     1.0,  1.0,  1.0,
+];
+
+/// https://landelare.github.io/2023/02/18/dxr-tutorial.html#mesh-data
+///
+/// The index buffer has two non-obvious properties that the shaders abuse:
+/// - Cube faces are ordered so that their normal vectors are -X, -Y, -Z, +X, +Y, +Z
+/// - The first vertex of each triangle is opposite its hypotenuse
+///
+/// The quad vertices are ordered to make barycentrics contiguous across the entire surface.
+pub const CUBE_INDICES: [u16; 36] = [
+    4, 6, 0, 2, 0, 6, 0, 1, 4, 5, 4, 1, //
+    0, 2, 1, 3, 1, 2, 1, 3, 5, 7, 5, 3, //
+    2, 6, 3, 7, 3, 6, 4, 5, 6, 7, 6, 5,
+];

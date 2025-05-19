@@ -13,7 +13,6 @@ use consts::NO_AA;
 use std::{
     cmp::max,
     num::NonZeroU64,
-    ops::DerefMut,
     sync::{Arc, Mutex},
 };
 
@@ -40,6 +39,13 @@ struct Resources {
     swap_chain: IDXGISwapChain3,
     render_target: Option<ID3D12Resource>,
     uav_heap: ID3D12DescriptorHeap,
+
+    cmd_allocator: ID3D12CommandAllocator,
+    cmd_list: ID3D12GraphicsCommandList4,
+
+    quad_vertex_buffer: ID3D12Resource,
+    cube_vertex_buffer: ID3D12Resource,
+    cube_index_buffer: ID3D12Resource,
 }
 
 struct Context {
@@ -186,6 +192,35 @@ fn init_resources(hwnd: HWND, context: Arc<Mutex<Context>>) -> windows::core::Re
 
         // drop(context.factory); // @Test: the factory is no longer needed, so we may as well drop it
 
+        // resize
+
+        // Init Commands.
+        let cmd_allocator = unsafe {
+            context
+                .device
+                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
+        }?;
+
+        let cmd_list = unsafe {
+            context.device.CreateCommandList1(
+                0,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                D3D12_COMMAND_LIST_FLAG_NONE,
+            )
+        }?;
+
+        // Init Meshes.
+        let quad_vertex_buffer = make_buffer(&context.device, &consts::QUAD_VERTICES)?;
+        let cube_vertex_buffer = make_buffer(&context.device, &consts::CUBE_VERTICES)?;
+        let cube_index_buffer = make_buffer(&context.device, &consts::CUBE_INDICES)?;
+
+        // @Continue: https://landelare.github.io/2023/02/18/dxr-tutorial.html#raytracing-acceleration-structures
+        // Init BottomLevel.
+        // Init Scene.
+        // Init TopLevel.
+        // Init RootSignature.
+        // Init Pipeline.
+
         context.resources = Some(Resources {
             cmd_queue,
             fence: unsafe { context.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }?,
@@ -202,6 +237,11 @@ fn init_resources(hwnd: HWND, context: Arc<Mutex<Context>>) -> windows::core::Re
                         ..Default::default()
                     })
             }?,
+            cmd_allocator,
+            cmd_list,
+            quad_vertex_buffer,
+            cube_vertex_buffer,
+            cube_index_buffer,
         });
     }
 
@@ -209,19 +249,8 @@ fn init_resources(hwnd: HWND, context: Arc<Mutex<Context>>) -> windows::core::Re
         std::ptr::NonNull::new_unchecked(context.as_ref() as *const _ as *mut _)
     });
 
-    // @Continue: https://landelare.github.io/2023/02/18/dxr-tutorial.html#command-list-and-allocator
-    // Init Command.
-    // Init Meshes.
-    // Init BottomLevel.
-    // Init Scene.
-    // Init TopLevel.
-    // Init RootSignature.
-    // Init Pipeline.
-
     Ok(())
 }
-
-// @Continue: https://landelare.github.io/2023/02/18/dxr-tutorial.html#swap-chain-uav
 
 fn signal_and_wait(
     fence_value: NonZeroU64,
@@ -235,6 +264,42 @@ fn signal_and_wait(
     }
 
     Ok(fence_value.saturating_add(1))
+}
+
+fn make_buffer<T: Copy>(
+    device: &ID3D12Device5,
+    data: &[T],
+) -> windows::core::Result<ID3D12Resource> {
+    let buffer = {
+        let mut desc = consts::BASIC_BUFFER_DESC;
+        desc.Width = std::mem::size_of_val(data) as u64;
+
+        let mut buffer: Option<ID3D12Resource> = None;
+        unsafe {
+            device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES {
+                    Type: D3D12_HEAP_TYPE_UPLOAD,
+                    ..Default::default()
+                },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut buffer,
+            )
+        }?;
+
+        buffer.expect("buffer should not be null after CreateCommittedResource is ok")
+    };
+
+    let mut mapped_data = std::ptr::null_mut();
+    unsafe {
+        buffer.Map(0, None, Some(&mut mapped_data))?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), mapped_data as *mut T, data.len());
+        buffer.Unmap(0, None);
+    }
+
+    Ok(buffer)
 }
 
 extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Context>>) {
