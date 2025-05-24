@@ -181,18 +181,9 @@ fn main() -> windows::core::Result<()> {
     // @Test: instead of moving the cloned value with Arc::into_raw, just cast the context to
     // a `*mut Mutex<Context>` and avoid `drop(unsafe { Arc::from_raw(context_ptr) })` in `wnd_proc`.
     let context_for_window = Arc::clone(&context);
-    unsafe {
-        SetWindowLongPtrW(
-            hwnd,
-            GWLP_USERDATA,
-            Arc::into_raw(context_for_window) as isize,
-        )
-    };
+    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::into_raw(context_for_window) as isize) };
 
-    resize(
-        hwnd,
-        std::ptr::NonNull::new(context.as_ref() as *const _ as *mut _).unwrap(),
-    );
+    resize(hwnd, std::ptr::NonNull::new(context.as_ref() as *const _ as *mut _).unwrap());
 
     // Init Meshes.
     let quad_vertex_buffer =
@@ -269,10 +260,7 @@ fn make_upload_buffer<T: Copy>(
         let mut buffer: Option<ID3D12Resource> = None;
         unsafe {
             device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_UPLOAD,
-                    ..Default::default()
-                },
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
                 D3D12_RESOURCE_STATE_COMMON,
@@ -307,10 +295,7 @@ fn make_unordered_access_default_buffer(
         let mut buffer: Option<ID3D12Resource> = None;
         unsafe {
             device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES {
-                    Type: D3D12_HEAP_TYPE_DEFAULT,
-                    ..Default::default()
-                },
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
                 D3D12_HEAP_FLAG_NONE,
                 &desc,
                 initial_state,
@@ -328,10 +313,8 @@ fn make_unordered_access_default_buffer(
 fn make_acceleration_structure(
     context: &mut Context,
     inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS,
-) -> windows::core::Result<(
-    ID3D12Resource,
-    D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO,
-)> {
+) -> windows::core::Result<(ID3D12Resource, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO)>
+{
     let Context { device, resources } = context;
 
     let mut prebuild_info = D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO::default();
@@ -358,20 +341,13 @@ fn make_acceleration_structure(
     unsafe {
         resources.cmd_allocator.Reset()?;
         resources.cmd_list.Reset(&resources.cmd_allocator, None)?;
-        resources
-            .cmd_list
-            .BuildRaytracingAccelerationStructure(&build_desc, None);
+        resources.cmd_list.BuildRaytracingAccelerationStructure(&build_desc, None);
         resources.cmd_list.Close()?;
-        resources
-            .cmd_queue
-            .ExecuteCommandLists(&[Some(resources.cmd_list.cast()?)]); // @Test: double-check .cast()
+        resources.cmd_queue.ExecuteCommandLists(&[Some(resources.cmd_list.cast()?)]); // @Test: double-check .cast()
     };
 
-    resources.fence_value = signal_and_wait(
-        resources.fence_value,
-        &resources.cmd_queue,
-        &resources.fence,
-    )?;
+    resources.fence_value =
+        signal_and_wait(resources.fence_value, &resources.cmd_queue, &resources.fence)?;
 
     Ok((result_buffer, prebuild_info))
 }
@@ -384,9 +360,9 @@ fn make_blas(
 ) -> windows::core::Result<ID3D12Resource> {
     let (index_format, index_count, index_buffer) = match index_buffer_and_count {
         // @Hardcode: DXGI_FORMAT_R16_UINT matches the u16 used for CUBE_INDICES.
-        Some((index_buffer, count)) => (DXGI_FORMAT_R16_UINT, count, unsafe {
-            index_buffer.GetGPUVirtualAddress()
-        }),
+        Some((index_buffer, count)) => {
+            (DXGI_FORMAT_R16_UINT, count, unsafe { index_buffer.GetGPUVirtualAddress() })
+        }
         None => (DXGI_FORMAT_UNKNOWN, 0, 0),
     };
 
@@ -432,12 +408,8 @@ extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Conte
     let width = max(1, rect.right - rect.left);
     let height = max(1, rect.bottom - rect.top);
 
-    resources.fence_value = signal_and_wait(
-        resources.fence_value,
-        &resources.cmd_queue,
-        &resources.fence,
-    )
-    .unwrap();
+    resources.fence_value =
+        signal_and_wait(resources.fence_value, &resources.cmd_queue, &resources.fence).unwrap();
 
     unsafe {
         resources.swap_chain.ResizeBuffers(
@@ -452,10 +424,7 @@ extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Conte
 
     unsafe {
         device.CreateCommittedResource(
-            &D3D12_HEAP_PROPERTIES {
-                Type: D3D12_HEAP_TYPE_DEFAULT,
-                ..Default::default()
-            },
+            &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
             D3D12_HEAP_FLAG_NONE,
             &D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,

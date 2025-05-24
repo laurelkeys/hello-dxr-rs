@@ -1,9 +1,6 @@
 use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
 
-pub const NO_AA: DXGI_SAMPLE_DESC = DXGI_SAMPLE_DESC {
-    Count: 1,
-    Quality: 0,
-};
+pub const NO_AA: DXGI_SAMPLE_DESC = DXGI_SAMPLE_DESC { Count: 1, Quality: 0 };
 
 pub const BASIC_BUFFER_DESC: D3D12_RESOURCE_DESC = D3D12_RESOURCE_DESC {
     Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
