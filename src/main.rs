@@ -7,6 +7,7 @@
 //
 
 mod consts;
+mod transform;
 
 use consts::NO_AA;
 
@@ -25,6 +26,7 @@ use windows::{
             Direct3D12::*,
             Dxgi::{Common::*, *},
         },
+        System::SystemInformation::GetTickCount64,
         UI::{HiDpi::*, WindowsAndMessaging::*},
     },
     core::Interface,
@@ -73,7 +75,7 @@ impl Context {
         let device = {
             let mut device: Option<ID3D12Device5> = None;
             unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_2, &mut device) }?;
-            device.expect("device should not be null after D3D12CreateDevice is ok")
+            device.expect("should not be null after D3D12CreateDevice is ok")
         };
 
         let cmd_queue: ID3D12CommandQueue = unsafe {
@@ -207,9 +209,110 @@ fn main() -> windows::core::Result<()> {
         Some((&cube_index_buffer, consts::CUBE_INDICES.len() as u32)),
     )?;
 
-    // @Continue: https://landelare.github.io/2023/02/18/dxr-tutorial.html#tlas
     // Init Scene.
+    let instances_buffer = {
+        let mut desc = consts::BASIC_BUFFER_DESC;
+        desc.Width =
+            (std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() * consts::INSTANCE_COUNT) as u64;
+
+        let mut instances_buffer: Option<ID3D12Resource> = None;
+        unsafe {
+            context.lock().unwrap().device.CreateCommittedResource(
+                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_COMMON,
+                None,
+                &mut instances_buffer,
+            )
+        }?;
+
+        instances_buffer.expect("should not be null after CreateCommittedResource is ok")
+    };
+
+    {
+        let mut mapped_data = std::ptr::null_mut();
+
+        unsafe { instances_buffer.Map(0, None, Some(&mut mapped_data)) }?;
+
+        let instances_data = mapped_data as *mut D3D12_RAYTRACING_INSTANCE_DESC;
+        let instance_descs =
+            unsafe { std::slice::from_raw_parts_mut(instances_data, consts::INSTANCE_COUNT) };
+
+        // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_raytracing_instance_desc
+        //
+        // typedef struct D3D12_RAYTRACING_INSTANCE_DESC {
+        //     FLOAT                     Transform[3][4];
+        //     UINT                      InstanceID : 24;
+        //     UINT                      InstanceMask : 8;
+        //     UINT                      InstanceContributionToHitGroupIndex : 24;
+        //     UINT                      Flags : 8;
+        //     D3D12_GPU_VIRTUAL_ADDRESS AccelerationStructure;
+        // } D3D12_RAYTRACING_INSTANCE_DESC;
+        //
+        // `Transform` is a 3x4 transform matrix in row-major layout representing the instance-to-world transformation.
+        //
+        // Note: The layout of `Transform` is a transpose of how affine matrices are typically stored in memory.
+        // Instead of four 3-vectors, `Transform` is laid out as three 4-vectors.
+
+        let make_bitfield1 = |instance_id, instance_mask| {
+            const MAX_U24: u32 = (1 << 24) - 1;
+            const LOW_U8_MASK: u32 = 0xFF; // = (1 << 8) - 1
+
+            (instance_id & MAX_U24) | ((instance_mask & LOW_U8_MASK) << 24)
+        };
+
+        for (i, desc) in instance_descs.iter_mut().enumerate() {
+            *desc = D3D12_RAYTRACING_INSTANCE_DESC {
+                _bitfield1: make_bitfield1(i as u32, 1),
+                AccelerationStructure: unsafe {
+                    if i == 0 {
+                        cube_blas.GetGPUVirtualAddress()
+                    } else {
+                        quad_blas.GetGPUVirtualAddress() // floor, mirror
+                    }
+                },
+                ..Default::default()
+            };
+        }
+
+        // Update transforms.
+        let [cube_to_world, floor_to_world, mirror_to_world] =
+            transform::compute_instance_to_world_transforms(
+                unsafe { GetTickCount64() } as f32 / 1000.0,
+            );
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                cube_to_world.as_ptr(),
+                instance_descs[0].Transform.as_mut_ptr(),
+                std::mem::size_of::<[f32; 12]>(),
+            );
+            std::ptr::copy_nonoverlapping(
+                floor_to_world.as_ptr(),
+                instance_descs[1].Transform.as_mut_ptr(),
+                std::mem::size_of::<[f32; 12]>(),
+            );
+            std::ptr::copy_nonoverlapping(
+                mirror_to_world.as_ptr(),
+                instance_descs[2].Transform.as_mut_ptr(),
+                std::mem::size_of::<[f32; 12]>(),
+            );
+        }
+
+        // Do not Unmap.
+    }
+
     // Init TopLevel.
+    let (tlas, prebuild_info) = make_tlas(context.lock().unwrap().deref_mut(), &instances_buffer)?;
+
+    let tlas_update_scratch_buffer = make_unordered_access_default_buffer(
+        &context.lock().unwrap().device,
+        max(prebuild_info.UpdateScratchDataSizeInBytes, 8),
+        D3D12_RESOURCE_STATE_COMMON, // UNORDERED_ACCESS,
+    )?;
+
+    // @Continue: https://landelare.github.io/2023/02/18/dxr-tutorial.html#root-signature
     // Init RootSignature.
     // Init Pipeline.
 
@@ -269,7 +372,7 @@ fn make_upload_buffer<T: Copy>(
             )
         }?;
 
-        buffer.expect("buffer should not be null after CreateCommittedResource is ok")
+        buffer.expect("should not be null after CreateCommittedResource is ok")
     };
 
     let mut mapped_data = std::ptr::null_mut();
@@ -304,7 +407,7 @@ fn make_unordered_access_default_buffer(
             )
         }?;
 
-        buffer.expect("buffer should not be null after CreateCommittedResource is ok")
+        buffer.expect("should not be null after CreateCommittedResource is ok")
     };
 
     Ok(buffer)
@@ -399,6 +502,24 @@ fn make_blas(
     make_acceleration_structure(context, inputs).map(|(result_buffer, _)| result_buffer)
 }
 
+fn make_tlas(
+    context: &mut Context,
+    instances_buffer: &ID3D12Resource,
+) -> windows::core::Result<(ID3D12Resource, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO)>
+{
+    let inputs = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+        Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+        Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_ALLOW_UPDATE,
+        NumDescs: consts::INSTANCE_COUNT as u32,
+        DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+        Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+            InstanceDescs: unsafe { instances_buffer.GetGPUVirtualAddress() },
+        },
+    };
+
+    make_acceleration_structure(context, inputs)
+}
+
 extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Context>>) {
     let mut context = unsafe { context.as_mut() }.lock().unwrap();
     let Context { device, resources } = &mut *context;
@@ -447,7 +568,7 @@ extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Conte
     let render_target = resources
         .render_target
         .as_ref()
-        .expect("render_target should not be null after CreateCommittedResource is ok");
+        .expect("should not be null after CreateCommittedResource is ok");
 
     unsafe {
         device.CreateUnorderedAccessView(

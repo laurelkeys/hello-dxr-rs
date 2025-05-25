@@ -15,6 +15,11 @@ pub const BASIC_BUFFER_DESC: D3D12_RESOURCE_DESC = D3D12_RESOURCE_DESC {
     Flags: D3D12_RESOURCE_FLAG_NONE,
 };
 
+// pub const CUBE_ID: usize = 0;
+// pub const FLOOR_ID: usize = 1;
+// pub const MIRROR_ID: usize = 2;
+pub const INSTANCE_COUNT: usize = 3; // @Hardcode: cube, floor, mirror
+
 #[rustfmt::skip]
 pub const QUAD_VERTICES: [f32; 18] = [
     -1.0, 0.0, -1.0,
