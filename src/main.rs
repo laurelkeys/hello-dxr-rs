@@ -286,17 +286,17 @@ fn main() -> windows::core::Result<()> {
             std::ptr::copy_nonoverlapping(
                 cube_to_world.as_ptr(),
                 instance_descs[0].Transform.as_mut_ptr(),
-                std::mem::size_of::<[f32; 12]>(),
+                12,
             );
             std::ptr::copy_nonoverlapping(
                 floor_to_world.as_ptr(),
                 instance_descs[1].Transform.as_mut_ptr(),
-                std::mem::size_of::<[f32; 12]>(),
+                12,
             );
             std::ptr::copy_nonoverlapping(
                 mirror_to_world.as_ptr(),
                 instance_descs[2].Transform.as_mut_ptr(),
-                std::mem::size_of::<[f32; 12]>(),
+                12,
             );
         }
 
