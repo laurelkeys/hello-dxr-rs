@@ -282,23 +282,9 @@ fn main() -> windows::core::Result<()> {
                 unsafe { GetTickCount64() } as f32 / 1000.0,
             );
 
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                cube_to_world.as_ptr(),
-                instance_descs[0].Transform.as_mut_ptr(),
-                12,
-            );
-            std::ptr::copy_nonoverlapping(
-                floor_to_world.as_ptr(),
-                instance_descs[1].Transform.as_mut_ptr(),
-                12,
-            );
-            std::ptr::copy_nonoverlapping(
-                mirror_to_world.as_ptr(),
-                instance_descs[2].Transform.as_mut_ptr(),
-                12,
-            );
-        }
+        instance_descs[0].Transform.copy_from_slice(&cube_to_world);
+        instance_descs[1].Transform.copy_from_slice(&floor_to_world);
+        instance_descs[2].Transform.copy_from_slice(&mirror_to_world);
 
         // Do not Unmap.
     }
