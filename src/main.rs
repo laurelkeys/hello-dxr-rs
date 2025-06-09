@@ -189,11 +189,11 @@ fn main() -> windows::core::Result<()> {
 
     // Init Meshes.
     let quad_vertex_buffer =
-        make_upload_buffer(&context.lock().unwrap().device, &consts::QUAD_VERTICES)?;
+        make_upload_buffer_from_slice(&context.lock().unwrap().device, &consts::QUAD_VERTICES)?;
     let cube_vertex_buffer =
-        make_upload_buffer(&context.lock().unwrap().device, &consts::CUBE_VERTICES)?;
+        make_upload_buffer_from_slice(&context.lock().unwrap().device, &consts::CUBE_VERTICES)?;
     let cube_index_buffer =
-        make_upload_buffer(&context.lock().unwrap().device, &consts::CUBE_INDICES)?;
+        make_upload_buffer_from_slice(&context.lock().unwrap().device, &consts::CUBE_INDICES)?;
 
     // Init BottomLevel.
     let quad_blas = make_blas(
@@ -210,25 +210,10 @@ fn main() -> windows::core::Result<()> {
     )?;
 
     // Init Scene.
-    let instances_buffer = {
-        let mut desc = consts::BASIC_BUFFER_DESC;
-        desc.Width =
-            (std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() * consts::INSTANCE_COUNT) as u64;
-
-        let mut instances_buffer: Option<ID3D12Resource> = None;
-        unsafe {
-            context.lock().unwrap().device.CreateCommittedResource(
-                &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_UPLOAD, ..Default::default() },
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COMMON,
-                None,
-                &mut instances_buffer,
-            )
-        }?;
-
-        instances_buffer.expect("should not be null after CreateCommittedResource is ok")
-    };
+    let instances_buffer = make_upload_buffer(
+        &context.lock().unwrap().device,
+        (std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() * consts::INSTANCE_COUNT) as u64,
+    )?;
 
     {
         let mut mapped_data = std::ptr::null_mut();
@@ -298,9 +283,149 @@ fn main() -> windows::core::Result<()> {
         D3D12_RESOURCE_STATE_COMMON, // UNORDERED_ACCESS,
     )?;
 
-    // @Continue: https://landelare.github.io/2023/02/18/dxr-tutorial.html#root-signature
     // Init RootSignature.
+    let root_signature: ID3D12RootSignature = {
+        let root_params = [
+            // RWTexture2D<float4> scene_output : register(u0);
+            D3D12_ROOT_PARAMETER {
+                // Note: 2D typed UAVs can only be bound as part of a descriptor table,
+                // even if we only have 1.
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                        NumDescriptorRanges: 1,
+                        pDescriptorRanges: &D3D12_DESCRIPTOR_RANGE {
+                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                            NumDescriptors: 1,
+                            ..Default::default()
+                        },
+                    },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+            // RaytracingAccelerationStructure scene_tlas : register(t0);
+            D3D12_ROOT_PARAMETER {
+                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                Anonymous: D3D12_ROOT_PARAMETER_0 {
+                    Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+                },
+                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+            },
+        ];
+
+        let blob = {
+            let mut blob: Option<ID3DBlob> = None;
+            unsafe {
+                D3D12SerializeRootSignature(
+                    &D3D12_ROOT_SIGNATURE_DESC {
+                        NumParameters: root_params.len() as u32,
+                        pParameters: root_params.as_ptr(),
+                        Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, // @Test
+                        ..Default::default()
+                    },
+                    D3D_ROOT_SIGNATURE_VERSION_1_0,
+                    &mut blob,
+                    None,
+                )
+            }?;
+
+            blob.expect("should not be null after D3D12SerializeRootSignature is ok")
+        };
+
+        let blob_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(blob.GetBufferPointer() as _, blob.GetBufferSize())
+        };
+
+        unsafe { context.lock().unwrap().device.CreateRootSignature(0, blob_bytes) }?
+    };
+
     // Init Pipeline.
+    let subobjects = [
+        D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+            pDesc: &D3D12_DXIL_LIBRARY_DESC {
+                DXILLibrary: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: COMPILED_SHADER.as_ptr() as _,
+                    BytecodeLength: COMPILED_SHADER.len(),
+                },
+                ..Default::default()
+            } as *const _ as _,
+        },
+        D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
+            pDesc: &D3D12_HIT_GROUP_DESC {
+                HitGroupExport: windows::core::w!("HitGroup"),
+                Type: D3D12_HIT_GROUP_TYPE_TRIANGLES,
+                AnyHitShaderImport: windows::core::PCWSTR::null(),
+                ClosestHitShaderImport: windows::core::w!("ClosestHit"), // [shader("closesthit")]
+                IntersectionShaderImport: windows::core::PCWSTR::null(),
+            } as *const _ as _,
+        },
+        D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
+            pDesc: &D3D12_RAYTRACING_SHADER_CONFIG {
+                MaxPayloadSizeInBytes: 20, // sizeof(Payload) = 12 (float3) + 4 (bool) + 4 (bool)
+                MaxAttributeSizeInBytes: 8, // sizeof(BuiltInTriangleIntersectionAttributes) == 8 (float2 barycentrics)
+            } as *const _ as _,
+        },
+        D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG,
+            pDesc: &D3D12_RAYTRACING_PIPELINE_CONFIG {
+                MaxTraceRecursionDepth: 3, // @Hardcode: camera -1-> mirror -2-> floor -3-> light
+            } as *const _ as _,
+        },
+        D3D12_STATE_SUBOBJECT {
+            Type: D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
+            pDesc: &D3D12_GLOBAL_ROOT_SIGNATURE {
+                pGlobalRootSignature: std::mem::ManuallyDrop::new(Some(root_signature)), // @Leak
+            } as *const _ as _,
+        },
+    ];
+
+    let pso: ID3D12StateObject = unsafe {
+        context.lock().unwrap().device.CreateStateObject(&D3D12_STATE_OBJECT_DESC {
+            Type: D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+            NumSubobjects: subobjects.len() as u32,
+            pSubobjects: subobjects.as_ptr(),
+        })
+    }?;
+
+    let shader_table_buffer = make_upload_buffer(
+        &context.lock().unwrap().device,
+        (D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT * 3) as u64, // [shader("...")] x3
+    )?;
+
+    {
+        let pso_props: ID3D12StateObjectProperties = pso.cast()?;
+
+        let mut mapped_data = std::ptr::null_mut();
+
+        unsafe { shader_table_buffer.Map(0, None, Some(&mut mapped_data)) }?;
+
+        for (i, id) in [
+            windows::core::w!("RayGeneration"), // [shader("raygeneration")]
+            windows::core::w!("Miss"),          // [shader("miss")]
+            // Shader 'ClosestHit' is not a shader type that supports producing shader identifiers.
+            // Shader type must be RayGeneration, Miss, Callable or a HitGroup.
+            windows::core::w!("HitGroup"), // [shader("closesthit")]
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            unsafe {
+                let id = pso_props.GetShaderIdentifier(id) as *mut u8;
+                id.copy_to_nonoverlapping(
+                    (mapped_data as *mut u8)
+                        .add(i * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as usize),
+                    D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize,
+                );
+            }
+        }
+
+        unsafe { shader_table_buffer.Unmap(0, None) };
+    }
+
+    // @Continue: https://landelare.github.io/2023/02/18/dxr-tutorial.html#tlas-update
 
     let mut msg = MSG::default();
     loop {
@@ -338,13 +463,13 @@ fn signal_and_wait(
     Ok(fence_value.saturating_add(1))
 }
 
-fn make_upload_buffer<T: Copy>(
+fn make_upload_buffer(
     device: &ID3D12Device5,
-    data: &[T],
+    size_in_bytes: u64,
 ) -> windows::core::Result<ID3D12Resource> {
     let buffer = {
         let mut desc = consts::BASIC_BUFFER_DESC;
-        desc.Width = std::mem::size_of_val(data) as u64;
+        desc.Width = size_in_bytes;
 
         let mut buffer: Option<ID3D12Resource> = None;
         unsafe {
@@ -361,24 +486,33 @@ fn make_upload_buffer<T: Copy>(
         buffer.expect("should not be null after CreateCommittedResource is ok")
     };
 
-    let mut mapped_data = std::ptr::null_mut();
-    unsafe {
-        buffer.Map(0, None, Some(&mut mapped_data))?;
-        std::ptr::copy_nonoverlapping(data.as_ptr(), mapped_data as *mut T, data.len());
-        buffer.Unmap(0, None);
-    }
-
     Ok(buffer)
+}
+
+fn make_upload_buffer_from_slice<T: Copy>(
+    device: &ID3D12Device5,
+    data: &[T],
+) -> windows::core::Result<ID3D12Resource> {
+    make_upload_buffer(device, std::mem::size_of_val(data) as u64).and_then(|buffer| {
+        let mut mapped_data = std::ptr::null_mut();
+        unsafe {
+            buffer.Map(0, None, Some(&mut mapped_data))?;
+            data.as_ptr().copy_to_nonoverlapping(mapped_data as *mut T, data.len());
+            buffer.Unmap(0, None);
+        }
+
+        Ok(buffer)
+    })
 }
 
 fn make_unordered_access_default_buffer(
     device: &ID3D12Device5,
-    size: u64,
+    size_in_bytes: u64,
     initial_state: D3D12_RESOURCE_STATES,
 ) -> windows::core::Result<ID3D12Resource> {
     let buffer = {
         let mut desc = consts::BASIC_BUFFER_DESC;
-        desc.Width = size;
+        desc.Width = size_in_bytes;
         desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
 
         let mut buffer: Option<ID3D12Resource> = None;
