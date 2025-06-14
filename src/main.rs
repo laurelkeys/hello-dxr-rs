@@ -142,6 +142,279 @@ impl Context {
     }
 }
 
+struct Scene<'instances_buffer> {
+    instances_buffer: ID3D12Resource,
+    /// Persistently-mapped view onto `instances_buffer`.
+    instance_descs: &'instances_buffer mut [D3D12_RAYTRACING_INSTANCE_DESC],
+
+    tlas: ID3D12Resource,
+    tlas_update_scratch: ID3D12Resource,
+
+    root_signature: ID3D12RootSignature,
+    pso: ID3D12StateObject,
+    shader_table_buffer: ID3D12Resource,
+}
+
+impl<'instances_buffer> Scene<'instances_buffer> {
+    fn new(
+        context: &mut Context,
+        quad_blas: ID3D12Resource,
+        cube_blas: ID3D12Resource,
+    ) -> windows::core::Result<Self> {
+        let instances_buffer = make_upload_buffer(
+            &context.device,
+            (std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() * consts::INSTANCE_COUNT) as u64,
+        )?;
+
+        let instance_descs = {
+            let mut mapped_data = std::ptr::null_mut();
+
+            unsafe { instances_buffer.Map(0, None, Some(&mut mapped_data)) }?;
+
+            let instances_data = mapped_data as *mut D3D12_RAYTRACING_INSTANCE_DESC;
+            let instance_descs =
+                unsafe { std::slice::from_raw_parts_mut(instances_data, consts::INSTANCE_COUNT) };
+
+            // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_raytracing_instance_desc
+            //
+            // typedef struct D3D12_RAYTRACING_INSTANCE_DESC {
+            //     FLOAT                     Transform[3][4];
+            //     UINT                      InstanceID : 24;
+            //     UINT                      InstanceMask : 8;
+            //     UINT                      InstanceContributionToHitGroupIndex : 24;
+            //     UINT                      Flags : 8;
+            //     D3D12_GPU_VIRTUAL_ADDRESS AccelerationStructure;
+            // } D3D12_RAYTRACING_INSTANCE_DESC;
+            //
+            // `Transform` is a 3x4 transform matrix in row-major layout representing the instance-to-world transformation.
+            //
+            // Note: The layout of `Transform` is a transpose of how affine matrices are typically stored in memory.
+            // Instead of four 3-vectors, `Transform` is laid out as three 4-vectors.
+
+            let make_bitfield1 = |instance_id, instance_mask| {
+                const MAX_U24: u32 = (1 << 24) - 1;
+                const LOW_U8_MASK: u32 = 0xFF; // = (1 << 8) - 1
+
+                (instance_id & MAX_U24) | ((instance_mask & LOW_U8_MASK) << 24)
+            };
+
+            for (i, desc) in instance_descs.iter_mut().enumerate() {
+                *desc = D3D12_RAYTRACING_INSTANCE_DESC {
+                    _bitfield1: make_bitfield1(i as u32, 1),
+                    AccelerationStructure: unsafe {
+                        if i == 0 {
+                            cube_blas.GetGPUVirtualAddress() // cube
+                        } else {
+                            quad_blas.GetGPUVirtualAddress() // floor, mirror
+                        }
+                    },
+                    ..Default::default()
+                };
+            }
+
+            update_instance_desc_transforms(instance_descs);
+
+            // Do not Unmap instances_buffer, such that instance_descs keeps mapped into the CPU
+            // and we later call update_instance_desc_transforms in update_scene.
+
+            instance_descs
+        };
+
+        // Init TopLevel.
+        let (tlas, prebuild_info) = make_tlas(context, &instances_buffer)?;
+
+        let tlas_update_scratch = make_unordered_access_default_buffer(
+            &context.device,
+            max(prebuild_info.UpdateScratchDataSizeInBytes, 8),
+            D3D12_RESOURCE_STATE_COMMON, // UNORDERED_ACCESS,
+        )?;
+
+        // Init RootSignature.
+        let root_signature: ID3D12RootSignature = {
+            let root_params = [
+                // RWTexture2D<float4> scene_output : register(u0);
+                D3D12_ROOT_PARAMETER {
+                    // Note: 2D typed UAVs can only be bound as part of a descriptor table,
+                    // even if we only have 1.
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: &D3D12_DESCRIPTOR_RANGE {
+                                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                                NumDescriptors: 1,
+                                ..Default::default()
+                            },
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+                // RaytracingAccelerationStructure scene_tlas : register(t0);
+                D3D12_ROOT_PARAMETER {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                },
+            ];
+
+            let blob = {
+                let mut blob: Option<ID3DBlob> = None;
+                unsafe {
+                    D3D12SerializeRootSignature(
+                        &D3D12_ROOT_SIGNATURE_DESC {
+                            NumParameters: root_params.len() as u32,
+                            pParameters: root_params.as_ptr(),
+                            Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, // @Test
+                            ..Default::default()
+                        },
+                        D3D_ROOT_SIGNATURE_VERSION_1_0,
+                        &mut blob,
+                        None,
+                    )
+                }?;
+
+                blob.expect("should not be null after D3D12SerializeRootSignature is ok")
+            };
+
+            let blob_bytes: &[u8] = unsafe {
+                std::slice::from_raw_parts(blob.GetBufferPointer() as _, blob.GetBufferSize())
+            };
+
+            unsafe { context.device.CreateRootSignature(0, blob_bytes) }?
+        };
+
+        // Init Pipeline.
+        let subobjects = [
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
+                pDesc: &D3D12_DXIL_LIBRARY_DESC {
+                    DXILLibrary: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: COMPILED_SHADER.as_ptr() as _,
+                        BytecodeLength: COMPILED_SHADER.len(),
+                    },
+                    ..Default::default()
+                } as *const _ as _,
+            },
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
+                pDesc: &D3D12_HIT_GROUP_DESC {
+                    HitGroupExport: windows::core::w!("HitGroup"),
+                    Type: D3D12_HIT_GROUP_TYPE_TRIANGLES,
+                    AnyHitShaderImport: windows::core::PCWSTR::null(),
+                    ClosestHitShaderImport: windows::core::w!("ClosestHit"), // [shader("closesthit")]
+                    IntersectionShaderImport: windows::core::PCWSTR::null(),
+                } as *const _ as _,
+            },
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
+                pDesc: &D3D12_RAYTRACING_SHADER_CONFIG {
+                    MaxPayloadSizeInBytes: 20, // sizeof(Payload) = 12 (float3) + 4 (bool) + 4 (bool)
+                    MaxAttributeSizeInBytes: 8, // sizeof(BuiltInTriangleIntersectionAttributes) == 8 (float2 barycentrics)
+                } as *const _ as _,
+            },
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG,
+                pDesc: &D3D12_RAYTRACING_PIPELINE_CONFIG {
+                    MaxTraceRecursionDepth: 3, // @Hardcode: camera -1-> mirror -2-> floor -3-> light
+                } as *const _ as _,
+            },
+            D3D12_STATE_SUBOBJECT {
+                Type: D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
+                pDesc: &D3D12_GLOBAL_ROOT_SIGNATURE {
+                    pGlobalRootSignature: std::mem::ManuallyDrop::new(Some(root_signature.clone())), // @Leak
+                } as *const _ as _,
+            },
+        ];
+
+        let pso: ID3D12StateObject = unsafe {
+            context.device.CreateStateObject(&D3D12_STATE_OBJECT_DESC {
+                Type: D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
+                NumSubobjects: subobjects.len() as u32,
+                pSubobjects: subobjects.as_ptr(),
+            })
+        }?;
+
+        let shader_table_buffer = make_upload_buffer(
+            &context.device,
+            (D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT * 3) as u64, // [shader("...")] x3
+        )?;
+
+        {
+            let pso_props: ID3D12StateObjectProperties = pso.cast()?;
+
+            let mut mapped_data = std::ptr::null_mut();
+
+            unsafe { shader_table_buffer.Map(0, None, Some(&mut mapped_data)) }?;
+
+            for (i, id) in [
+                windows::core::w!("RayGeneration"), // [shader("raygeneration")]
+                windows::core::w!("Miss"),          // [shader("miss")]
+                // Shader 'ClosestHit' is not a shader type that supports producing shader identifiers.
+                // Shader type must be RayGeneration, Miss, Callable or a HitGroup.
+                windows::core::w!("HitGroup"), // [shader("closesthit")]
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                unsafe {
+                    let id = pso_props.GetShaderIdentifier(id) as *mut u8;
+                    id.copy_to_nonoverlapping(
+                        (mapped_data as *mut u8)
+                            .add(i * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as usize),
+                        D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize,
+                    );
+                }
+            }
+
+            unsafe { shader_table_buffer.Unmap(0, None) };
+        }
+
+        Ok(Scene {
+            instances_buffer,
+            instance_descs,
+            tlas,
+            tlas_update_scratch,
+            root_signature,
+            pso,
+            shader_table_buffer,
+        })
+    }
+
+    unsafe fn record_update(
+        &mut self,
+        cmd_list: &ID3D12GraphicsCommandList4,
+    ) -> windows::core::Result<()> {
+        update_instance_desc_transforms(self.instance_descs);
+
+        let build_desc = D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_DESC {
+            DestAccelerationStructureData: unsafe { self.tlas.GetGPUVirtualAddress() },
+            Inputs: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS {
+                Type: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL,
+                Flags: D3D12_RAYTRACING_ACCELERATION_STRUCTURE_BUILD_FLAG_PERFORM_UPDATE,
+                NumDescs: consts::INSTANCE_COUNT as u32,
+                DescsLayout: D3D12_ELEMENTS_LAYOUT_ARRAY,
+                Anonymous: D3D12_BUILD_RAYTRACING_ACCELERATION_STRUCTURE_INPUTS_0 {
+                    InstanceDescs: unsafe { self.instances_buffer.GetGPUVirtualAddress() },
+                },
+            },
+            SourceAccelerationStructureData: unsafe { self.tlas.GetGPUVirtualAddress() },
+            ScratchAccelerationStructureData: unsafe {
+                self.tlas_update_scratch.GetGPUVirtualAddress()
+            },
+        };
+
+        unsafe {
+            // @Test: record_uav_barrier.
+            cmd_list.BuildRaytracingAccelerationStructure(&build_desc, None);
+            record_uav_barrier(cmd_list, &self.tlas);
+        }
+
+        Ok(())
+    }
+}
+
 fn main() -> windows::core::Result<()> {
     println!("Hello, DXR!");
 
@@ -210,222 +483,7 @@ fn main() -> windows::core::Result<()> {
     )?;
 
     // Init Scene.
-    let instances_buffer = make_upload_buffer(
-        &context.lock().unwrap().device,
-        (std::mem::size_of::<D3D12_RAYTRACING_INSTANCE_DESC>() * consts::INSTANCE_COUNT) as u64,
-    )?;
-
-    {
-        let mut mapped_data = std::ptr::null_mut();
-
-        unsafe { instances_buffer.Map(0, None, Some(&mut mapped_data)) }?;
-
-        let instances_data = mapped_data as *mut D3D12_RAYTRACING_INSTANCE_DESC;
-        let instance_descs =
-            unsafe { std::slice::from_raw_parts_mut(instances_data, consts::INSTANCE_COUNT) };
-
-        // https://learn.microsoft.com/en-us/windows/win32/api/d3d12/ns-d3d12-d3d12_raytracing_instance_desc
-        //
-        // typedef struct D3D12_RAYTRACING_INSTANCE_DESC {
-        //     FLOAT                     Transform[3][4];
-        //     UINT                      InstanceID : 24;
-        //     UINT                      InstanceMask : 8;
-        //     UINT                      InstanceContributionToHitGroupIndex : 24;
-        //     UINT                      Flags : 8;
-        //     D3D12_GPU_VIRTUAL_ADDRESS AccelerationStructure;
-        // } D3D12_RAYTRACING_INSTANCE_DESC;
-        //
-        // `Transform` is a 3x4 transform matrix in row-major layout representing the instance-to-world transformation.
-        //
-        // Note: The layout of `Transform` is a transpose of how affine matrices are typically stored in memory.
-        // Instead of four 3-vectors, `Transform` is laid out as three 4-vectors.
-
-        let make_bitfield1 = |instance_id, instance_mask| {
-            const MAX_U24: u32 = (1 << 24) - 1;
-            const LOW_U8_MASK: u32 = 0xFF; // = (1 << 8) - 1
-
-            (instance_id & MAX_U24) | ((instance_mask & LOW_U8_MASK) << 24)
-        };
-
-        for (i, desc) in instance_descs.iter_mut().enumerate() {
-            *desc = D3D12_RAYTRACING_INSTANCE_DESC {
-                _bitfield1: make_bitfield1(i as u32, 1),
-                AccelerationStructure: unsafe {
-                    if i == 0 {
-                        cube_blas.GetGPUVirtualAddress()
-                    } else {
-                        quad_blas.GetGPUVirtualAddress() // floor, mirror
-                    }
-                },
-                ..Default::default()
-            };
-        }
-
-        // Update transforms.
-        let [cube_to_world, floor_to_world, mirror_to_world] =
-            transform::compute_instance_to_world_transforms(
-                unsafe { GetTickCount64() } as f32 / 1000.0,
-            );
-
-        instance_descs[0].Transform.copy_from_slice(&cube_to_world);
-        instance_descs[1].Transform.copy_from_slice(&floor_to_world);
-        instance_descs[2].Transform.copy_from_slice(&mirror_to_world);
-
-        // Do not Unmap.
-    }
-
-    // Init TopLevel.
-    let (tlas, prebuild_info) = make_tlas(context.lock().unwrap().deref_mut(), &instances_buffer)?;
-
-    let tlas_update_scratch_buffer = make_unordered_access_default_buffer(
-        &context.lock().unwrap().device,
-        max(prebuild_info.UpdateScratchDataSizeInBytes, 8),
-        D3D12_RESOURCE_STATE_COMMON, // UNORDERED_ACCESS,
-    )?;
-
-    // Init RootSignature.
-    let root_signature: ID3D12RootSignature = {
-        let root_params = [
-            // RWTexture2D<float4> scene_output : register(u0);
-            D3D12_ROOT_PARAMETER {
-                // Note: 2D typed UAVs can only be bound as part of a descriptor table,
-                // even if we only have 1.
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
-                        NumDescriptorRanges: 1,
-                        pDescriptorRanges: &D3D12_DESCRIPTOR_RANGE {
-                            RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
-                            NumDescriptors: 1,
-                            ..Default::default()
-                        },
-                    },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-            // RaytracingAccelerationStructure scene_tlas : register(t0);
-            D3D12_ROOT_PARAMETER {
-                ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
-                Anonymous: D3D12_ROOT_PARAMETER_0 {
-                    Descriptor: D3D12_ROOT_DESCRIPTOR { ShaderRegister: 0, RegisterSpace: 0 },
-                },
-                ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
-            },
-        ];
-
-        let blob = {
-            let mut blob: Option<ID3DBlob> = None;
-            unsafe {
-                D3D12SerializeRootSignature(
-                    &D3D12_ROOT_SIGNATURE_DESC {
-                        NumParameters: root_params.len() as u32,
-                        pParameters: root_params.as_ptr(),
-                        Flags: D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT, // @Test
-                        ..Default::default()
-                    },
-                    D3D_ROOT_SIGNATURE_VERSION_1_0,
-                    &mut blob,
-                    None,
-                )
-            }?;
-
-            blob.expect("should not be null after D3D12SerializeRootSignature is ok")
-        };
-
-        let blob_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(blob.GetBufferPointer() as _, blob.GetBufferSize())
-        };
-
-        unsafe { context.lock().unwrap().device.CreateRootSignature(0, blob_bytes) }?
-    };
-
-    // Init Pipeline.
-    let subobjects = [
-        D3D12_STATE_SUBOBJECT {
-            Type: D3D12_STATE_SUBOBJECT_TYPE_DXIL_LIBRARY,
-            pDesc: &D3D12_DXIL_LIBRARY_DESC {
-                DXILLibrary: D3D12_SHADER_BYTECODE {
-                    pShaderBytecode: COMPILED_SHADER.as_ptr() as _,
-                    BytecodeLength: COMPILED_SHADER.len(),
-                },
-                ..Default::default()
-            } as *const _ as _,
-        },
-        D3D12_STATE_SUBOBJECT {
-            Type: D3D12_STATE_SUBOBJECT_TYPE_HIT_GROUP,
-            pDesc: &D3D12_HIT_GROUP_DESC {
-                HitGroupExport: windows::core::w!("HitGroup"),
-                Type: D3D12_HIT_GROUP_TYPE_TRIANGLES,
-                AnyHitShaderImport: windows::core::PCWSTR::null(),
-                ClosestHitShaderImport: windows::core::w!("ClosestHit"), // [shader("closesthit")]
-                IntersectionShaderImport: windows::core::PCWSTR::null(),
-            } as *const _ as _,
-        },
-        D3D12_STATE_SUBOBJECT {
-            Type: D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_SHADER_CONFIG,
-            pDesc: &D3D12_RAYTRACING_SHADER_CONFIG {
-                MaxPayloadSizeInBytes: 20, // sizeof(Payload) = 12 (float3) + 4 (bool) + 4 (bool)
-                MaxAttributeSizeInBytes: 8, // sizeof(BuiltInTriangleIntersectionAttributes) == 8 (float2 barycentrics)
-            } as *const _ as _,
-        },
-        D3D12_STATE_SUBOBJECT {
-            Type: D3D12_STATE_SUBOBJECT_TYPE_RAYTRACING_PIPELINE_CONFIG,
-            pDesc: &D3D12_RAYTRACING_PIPELINE_CONFIG {
-                MaxTraceRecursionDepth: 3, // @Hardcode: camera -1-> mirror -2-> floor -3-> light
-            } as *const _ as _,
-        },
-        D3D12_STATE_SUBOBJECT {
-            Type: D3D12_STATE_SUBOBJECT_TYPE_GLOBAL_ROOT_SIGNATURE,
-            pDesc: &D3D12_GLOBAL_ROOT_SIGNATURE {
-                pGlobalRootSignature: std::mem::ManuallyDrop::new(Some(root_signature)), // @Leak
-            } as *const _ as _,
-        },
-    ];
-
-    let pso: ID3D12StateObject = unsafe {
-        context.lock().unwrap().device.CreateStateObject(&D3D12_STATE_OBJECT_DESC {
-            Type: D3D12_STATE_OBJECT_TYPE_RAYTRACING_PIPELINE,
-            NumSubobjects: subobjects.len() as u32,
-            pSubobjects: subobjects.as_ptr(),
-        })
-    }?;
-
-    let shader_table_buffer = make_upload_buffer(
-        &context.lock().unwrap().device,
-        (D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT * 3) as u64, // [shader("...")] x3
-    )?;
-
-    {
-        let pso_props: ID3D12StateObjectProperties = pso.cast()?;
-
-        let mut mapped_data = std::ptr::null_mut();
-
-        unsafe { shader_table_buffer.Map(0, None, Some(&mut mapped_data)) }?;
-
-        for (i, id) in [
-            windows::core::w!("RayGeneration"), // [shader("raygeneration")]
-            windows::core::w!("Miss"),          // [shader("miss")]
-            // Shader 'ClosestHit' is not a shader type that supports producing shader identifiers.
-            // Shader type must be RayGeneration, Miss, Callable or a HitGroup.
-            windows::core::w!("HitGroup"), // [shader("closesthit")]
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            unsafe {
-                let id = pso_props.GetShaderIdentifier(id) as *mut u8;
-                id.copy_to_nonoverlapping(
-                    (mapped_data as *mut u8)
-                        .add(i * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as usize),
-                    D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as usize,
-                );
-            }
-        }
-
-        unsafe { shader_table_buffer.Unmap(0, None) };
-    }
-
-    // @Continue: https://landelare.github.io/2023/02/18/dxr-tutorial.html#tlas-update
+    let mut scene = Scene::new(context.lock().unwrap().deref_mut(), quad_blas, cube_blas)?;
 
     let mut msg = MSG::default();
     loop {
@@ -441,12 +499,132 @@ fn main() -> windows::core::Result<()> {
             }
         }
 
-        render_frame();
+        render_frame(&mut context.lock().unwrap().resources, &mut scene)?;
     }
 }
 
-fn render_frame() {
-    todo!()
+fn update_instance_desc_transforms(instance_descs: &mut [D3D12_RAYTRACING_INSTANCE_DESC]) {
+    let [cube_to_world, floor_to_world, mirror_to_world] =
+        transform::compute_instance_to_world_transforms(
+            unsafe { GetTickCount64() } as f32 / 1000.0,
+        );
+
+    instance_descs[0].Transform.copy_from_slice(&cube_to_world);
+    instance_descs[1].Transform.copy_from_slice(&floor_to_world);
+    instance_descs[2].Transform.copy_from_slice(&mirror_to_world);
+}
+
+fn render_frame(resources: &mut Resources, scene: &mut Scene) -> windows::core::Result<()> {
+    let render_target = resources.render_target.as_ref().unwrap();
+
+    let dispatch_rays_desc = {
+        let D3D12_RESOURCE_DESC { Width, Height, .. } = unsafe { render_target.GetDesc() };
+
+        let base_addr = unsafe { scene.shader_table_buffer.GetGPUVirtualAddress() };
+
+        #[allow(non_snake_case)]
+        let (SizeInBytes, StrideInBytes) = (
+            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as u64,
+            D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as u64,
+        );
+
+        D3D12_DISPATCH_RAYS_DESC {
+            RayGenerationShaderRecord: D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
+                StartAddress: base_addr + StrideInBytes * 0,
+                SizeInBytes,
+            },
+            MissShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                StartAddress: base_addr + StrideInBytes * 1,
+                SizeInBytes,
+                StrideInBytes: 0, // @Fixme
+            },
+            HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                StartAddress: base_addr + StrideInBytes * 2,
+                SizeInBytes,
+                StrideInBytes: 0, // @Fixme
+            },
+            CallableShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
+                ..Default::default()
+            },
+            Width: Width as u32,
+            Height,
+            Depth: 1,
+        }
+    };
+
+    unsafe {
+        resources.cmd_allocator.Reset()?;
+        resources.cmd_list.Reset(&resources.cmd_allocator, None)?;
+
+        scene.record_update(&resources.cmd_list)?; // does BuildRaytracingAccelerationStructure
+
+        resources.cmd_list.SetPipelineState1(&scene.pso);
+        resources.cmd_list.SetComputeRootSignature(&scene.root_signature);
+        resources.cmd_list.SetDescriptorHeaps(&[Some(resources.uav_heap.clone())]);
+        resources.cmd_list.SetComputeRootDescriptorTable(
+            0, // u0: UAV (scene_output)
+            resources.uav_heap.GetGPUDescriptorHandleForHeapStart(),
+        );
+        resources.cmd_list.SetComputeRootShaderResourceView(
+            1, // t0: TLAS (scene_tlas)
+            scene.tlas.GetGPUVirtualAddress(),
+        );
+
+        resources.cmd_list.DispatchRays(&dispatch_rays_desc);
+
+        let bb_index = resources.swap_chain.GetCurrentBackBufferIndex();
+        let back_buffer: ID3D12Resource = resources.swap_chain.GetBuffer(bb_index)?;
+
+        record_transition_barrier(
+            &resources.cmd_list,
+            render_target,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+        );
+        record_transition_barrier(
+            &resources.cmd_list,
+            &back_buffer,
+            D3D12_RESOURCE_STATE_PRESENT,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+        );
+
+        resources.cmd_list.CopyResource(&back_buffer, render_target);
+
+        record_transition_barrier(
+            &resources.cmd_list,
+            &back_buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST,
+            D3D12_RESOURCE_STATE_PRESENT,
+        );
+        record_transition_barrier(
+            &resources.cmd_list,
+            render_target,
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+        );
+
+        resources.cmd_list.Close()?;
+        resources.cmd_queue.ExecuteCommandLists(&[Some(resources.cmd_list.cast()?)]);
+        /* };
+
+        unsafe { */
+        resources.fence_value =
+            signal_and_wait(resources.fence_value, &resources.cmd_queue, &resources.fence)?;
+
+        // @Fixme: Present failed: HRESULT(0x887A0005)
+        //
+        // D3D12 ERROR: ID3D12Device::RemoveDevice: Device removal has been triggered for the following reason
+        // (DXGI_ERROR_DEVICE_HUNG:
+        //  The Device took an unreasonable amount of time to execute its commands, or the hardware crashed/hung.
+        //  As a result, the TDR (Timeout Detection and Recovery) mechanism has been triggered.
+        //  The current Device Context was executing commands when the hang occurred.
+        //  The application may want to respawn and fallback to less aggressive use of the display hardware).
+        // [ EXECUTION ERROR #232: DEVICE_REMOVAL_PROCESS_AT_FAULT]
+        let hr = resources.swap_chain.Present(1, DXGI_PRESENT::default());
+        assert!(hr.is_ok(), "Present failed: {:?}", hr);
+    };
+
+    Ok(())
 }
 
 fn signal_and_wait(
@@ -461,6 +639,42 @@ fn signal_and_wait(
     }
 
     Ok(fence_value.saturating_add(1))
+}
+
+unsafe fn record_uav_barrier(cmd_list: &ID3D12GraphicsCommandList4, resource: &ID3D12Resource) {
+    unsafe {
+        cmd_list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(resource.clone())), // @Leak
+                }),
+            },
+        }])
+    };
+}
+
+unsafe fn record_transition_barrier(
+    cmd_list: &ID3D12GraphicsCommandList4,
+    resource: &ID3D12Resource,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) {
+    unsafe {
+        cmd_list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(resource.clone())), // @Leak
+                    Subresource: 0, // @Test: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    StateBefore: before,
+                    StateAfter: after,
+                }),
+            },
+        }])
+    };
 }
 
 fn make_upload_buffer(
@@ -564,9 +778,11 @@ fn make_acceleration_structure(
     unsafe {
         resources.cmd_allocator.Reset()?;
         resources.cmd_list.Reset(&resources.cmd_allocator, None)?;
+
         resources.cmd_list.BuildRaytracingAccelerationStructure(&build_desc, None);
+
         resources.cmd_list.Close()?;
-        resources.cmd_queue.ExecuteCommandLists(&[Some(resources.cmd_list.cast()?)]); // @Test: double-check .cast()
+        resources.cmd_queue.ExecuteCommandLists(&[Some(resources.cmd_list.cast()?)]);
     };
 
     resources.fence_value =
