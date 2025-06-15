@@ -38,6 +38,12 @@ const COMPILED_SHADER: &[u8] = include_bytes!("shader.o");
 /// Format to be used by the swap chain and render target.
 const COLOR_FORMAT: DXGI_FORMAT = DXGI_FORMAT_R8G8B8A8_UNORM;
 
+/// If true, GPU based validation is enabled in debug mode.
+// @Todo: https://github.com/MicrosoftDocs/win32/blob/docs/desktop-src/direct3d12/use-dred.md
+const DEBUG_PARANOIA: bool = false;
+
+const SET_DEBUG_NAMES: bool = cfg!(debug_assertions);
+
 struct Resources {
     cmd_queue: ID3D12CommandQueue,
     fence: ID3D12Fence,
@@ -64,8 +70,14 @@ impl Context {
             unsafe {
                 let mut debug: Option<ID3D12Debug> = None;
                 if let Some(debug) = D3D12GetDebugInterface(&mut debug).ok().and(debug) {
-                    factory_flags |= DXGI_CREATE_FACTORY_DEBUG;
                     debug.EnableDebugLayer();
+
+                    if DEBUG_PARANOIA {
+                        let debug: ID3D12Debug1 = debug.cast()?;
+                        debug.SetEnableGPUBasedValidation(true);
+                    }
+
+                    factory_flags |= DXGI_CREATE_FACTORY_DEBUG;
                 }
             }
         }
@@ -158,8 +170,8 @@ struct Scene<'instances_buffer> {
 impl<'instances_buffer> Scene<'instances_buffer> {
     fn new(
         context: &mut Context,
-        quad_blas: ID3D12Resource,
-        cube_blas: ID3D12Resource,
+        quad_blas: &ID3D12Resource,
+        cube_blas: &ID3D12Resource,
     ) -> windows::core::Result<Self> {
         let instances_buffer = make_upload_buffer(
             &context.device,
@@ -458,6 +470,20 @@ fn main() -> windows::core::Result<()> {
     let context_for_window = Arc::clone(&context);
     unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Arc::into_raw(context_for_window) as isize) };
 
+    if SET_DEBUG_NAMES {
+        unsafe {
+            use windows::core::w;
+
+            let context = &context.lock().unwrap();
+            context.device.cast::<ID3D12Object>().unwrap().SetName(w!("device"))?;
+            context.resources.cmd_queue.cast::<ID3D12Object>().unwrap().SetName(w!("cmd_queue"))?;
+            context.resources.cmd_queue.cast::<ID3D12Object>().unwrap().SetName(w!("cmd_queue"))?;
+            context.resources.fence.cast::<ID3D12Object>().unwrap().SetName(w!("fence"))?;
+            //context.resources.swap_chain.cast::<ID3D12Object>().unwrap().SetName(w!("swap_chain"))?;
+            context.resources.uav_heap.cast::<ID3D12Object>().unwrap().SetName(w!("uav_heap"))?;
+        }
+    }
+
     resize(hwnd, std::ptr::NonNull::new(context.as_ref() as *const _ as *mut _).unwrap());
 
     // Init Meshes.
@@ -482,8 +508,46 @@ fn main() -> windows::core::Result<()> {
         Some((&cube_index_buffer, consts::CUBE_INDICES.len() as u32)),
     )?;
 
+    if SET_DEBUG_NAMES {
+        unsafe {
+            use windows::core::w;
+
+            quad_vertex_buffer.cast::<ID3D12Object>().unwrap().SetName(w!("quad_vertex_buffer"))?;
+            cube_vertex_buffer.cast::<ID3D12Object>().unwrap().SetName(w!("cube_vertex_buffer"))?;
+            cube_index_buffer.cast::<ID3D12Object>().unwrap().SetName(w!("cube_index_buffer"))?;
+
+            quad_blas.cast::<ID3D12Object>().unwrap().SetName(w!("quad_blas"))?;
+            cube_blas.cast::<ID3D12Object>().unwrap().SetName(w!("cube_blas"))?;
+        }
+    }
+
     // Init Scene.
-    let mut scene = Scene::new(context.lock().unwrap().deref_mut(), quad_blas, cube_blas)?;
+    let mut scene = Scene::new(context.lock().unwrap().deref_mut(), &quad_blas, &cube_blas)?;
+
+    if SET_DEBUG_NAMES {
+        unsafe {
+            use windows::core::w;
+
+            scene
+                .instances_buffer
+                .cast::<ID3D12Object>()
+                .unwrap()
+                .SetName(w!("instances_buffer"))?;
+            scene.tlas.cast::<ID3D12Object>().unwrap().SetName(w!("tlas"))?;
+            scene
+                .tlas_update_scratch
+                .cast::<ID3D12Object>()
+                .unwrap()
+                .SetName(w!("tlas_update_scratch"))?;
+            scene.root_signature.cast::<ID3D12Object>().unwrap().SetName(w!("root_signature"))?;
+            scene.pso.cast::<ID3D12Object>().unwrap().SetName(w!("pso"))?;
+            scene
+                .shader_table_buffer
+                .cast::<ID3D12Object>()
+                .unwrap()
+                .SetName(w!("shader_table_buffer"))?;
+        }
+    }
 
     let mut msg = MSG::default();
     loop {
@@ -499,7 +563,17 @@ fn main() -> windows::core::Result<()> {
             }
         }
 
-        render_frame(&mut context.lock().unwrap().resources, &mut scene)?;
+        match context.lock().unwrap().deref_mut() {
+            Context { device, resources } => {
+                if let Err(err) = render_frame(resources, &mut scene) {
+                    eprintln!("render_frame failed: {:?}", err);
+                    if let Err(reason) = unsafe { device.GetDeviceRemovedReason() } {
+                        eprintln!("GetDeviceRemovedReason: {:?}", reason);
+                    }
+                    return Err(err);
+                }
+            }
+        }
     }
 }
 
@@ -522,30 +596,22 @@ fn render_frame(resources: &mut Resources, scene: &mut Scene) -> windows::core::
 
         let base_addr = unsafe { scene.shader_table_buffer.GetGPUVirtualAddress() };
 
-        #[allow(non_snake_case)]
-        let (SizeInBytes, StrideInBytes) = (
-            D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as u64,
-            D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as u64,
-        );
-
         D3D12_DISPATCH_RAYS_DESC {
             RayGenerationShaderRecord: D3D12_GPU_VIRTUAL_ADDRESS_RANGE {
-                StartAddress: base_addr + StrideInBytes * 0,
-                SizeInBytes,
+                StartAddress: base_addr + 0 * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as u64,
+                SizeInBytes: D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as u64,
             },
             MissShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
-                StartAddress: base_addr + StrideInBytes * 1,
-                SizeInBytes,
-                StrideInBytes: 0, // @Fixme
+                StartAddress: base_addr + 1 * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as u64,
+                SizeInBytes: D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as u64,
+                StrideInBytes: 0, // @Test: D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT as u64,
             },
             HitGroupTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
-                StartAddress: base_addr + StrideInBytes * 2,
-                SizeInBytes,
-                StrideInBytes: 0, // @Fixme
+                StartAddress: base_addr + 2 * D3D12_RAYTRACING_SHADER_TABLE_BYTE_ALIGNMENT as u64,
+                SizeInBytes: D3D12_SHADER_IDENTIFIER_SIZE_IN_BYTES as u64,
+                StrideInBytes: 0, // @Test: D3D12_RAYTRACING_SHADER_RECORD_BYTE_ALIGNMENT as u64,
             },
-            CallableShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE {
-                ..Default::default()
-            },
+            CallableShaderTable: D3D12_GPU_VIRTUAL_ADDRESS_RANGE_AND_STRIDE::default(),
             Width: Width as u32,
             Height,
             Depth: 1,
@@ -574,6 +640,12 @@ fn render_frame(resources: &mut Resources, scene: &mut Scene) -> windows::core::
 
         let bb_index = resources.swap_chain.GetCurrentBackBufferIndex();
         let back_buffer: ID3D12Resource = resources.swap_chain.GetBuffer(bb_index)?;
+        if SET_DEBUG_NAMES {
+            back_buffer
+                .cast::<ID3D12Object>()
+                .unwrap()
+                .SetName(windows::core::w!("back_buffer"))?;
+        }
 
         record_transition_barrier(
             &resources.cmd_list,
@@ -603,14 +675,16 @@ fn render_frame(resources: &mut Resources, scene: &mut Scene) -> windows::core::
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         );
 
+        drop(back_buffer);
+
         resources.cmd_list.Close()?;
         resources.cmd_queue.ExecuteCommandLists(&[Some(resources.cmd_list.cast()?)]);
-        /* };
+    };
 
-        unsafe { */
-        resources.fence_value =
-            signal_and_wait(resources.fence_value, &resources.cmd_queue, &resources.fence)?;
+    resources.fence_value =
+        signal_and_wait(resources.fence_value, &resources.cmd_queue, &resources.fence)?;
 
+    unsafe {
         // @Fixme: Present failed: HRESULT(0x887A0005)
         //
         // D3D12 ERROR: ID3D12Device::RemoveDevice: Device removal has been triggered for the following reason
@@ -621,7 +695,11 @@ fn render_frame(resources: &mut Resources, scene: &mut Scene) -> windows::core::
         //  The application may want to respawn and fallback to less aggressive use of the display hardware).
         // [ EXECUTION ERROR #232: DEVICE_REMOVAL_PROCESS_AT_FAULT]
         let hr = resources.swap_chain.Present(1, DXGI_PRESENT::default());
-        assert!(hr.is_ok(), "Present failed: {:?}", hr);
+
+        if hr.is_err() {
+            eprintln!("Present failed: {:?}", hr);
+            return Err(windows::core::Error::from_hresult(hr));
+        }
     };
 
     Ok(())
@@ -879,6 +957,10 @@ extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Conte
     }
     .unwrap();
 
+    resources.render_target.take(); // @Test
+
+    assert!(resources.render_target.is_none());
+
     unsafe {
         device.CreateCommittedResource(
             &D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() },
@@ -901,10 +983,22 @@ extern "system" fn resize(hwnd: HWND, mut context: std::ptr::NonNull<Mutex<Conte
     }
     .unwrap();
 
+    assert!(resources.render_target.is_some());
+
     let render_target = resources
         .render_target
         .as_ref()
         .expect("should not be null after CreateCommittedResource is ok");
+
+    if SET_DEBUG_NAMES {
+        unsafe {
+            render_target
+                .cast::<ID3D12Object>()
+                .unwrap()
+                .SetName(windows::core::w!("render_target"))
+                .unwrap();
+        }
+    }
 
     unsafe {
         device.CreateUnorderedAccessView(
@@ -927,7 +1021,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     match msg {
         WM_SIZING | WM_SIZE => {
             if let Some(context) = std::ptr::NonNull::new(context_ptr) {
-                resize(hwnd, context);
+                resize(hwnd, context); // @Fixme
             }
         }
         WM_CLOSE | WM_DESTROY => {
@@ -936,6 +1030,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
                 drop(unsafe { Arc::from_raw(context_ptr) });
             }
             unsafe { PostQuitMessage(0) };
+            // @Test: resize(?)
         }
         _ => {}
     }
